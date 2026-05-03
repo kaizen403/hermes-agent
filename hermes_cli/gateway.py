@@ -2431,7 +2431,7 @@ def launchd_status(deep: bool = False):
 # Gateway Runner
 # =============================================================================
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
+def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force_replace: bool = False):
     """Run the gateway in foreground.
     
     Args:
@@ -2440,6 +2440,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
         replace: If True, kill any existing gateway instance before starting.
                  This prevents systemd restart loops when the old process
                  hasn't fully exited yet.
+        force_replace: If True, bypass the default-profile safety guard that
+                 normally refuses --replace when an established default-profile
+                 gateway is already running.
     """
     sys.path.insert(0, str(PROJECT_ROOT))
     
@@ -2457,7 +2460,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
     # so systemd Restart=always will retry on transient errors
     verbosity = None if quiet else verbose
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        success = asyncio.run(start_gateway(replace=replace, force_replace=force_replace, verbosity=verbosity))
     except KeyboardInterrupt:
         print("\nGateway stopped.")
         return
@@ -4145,7 +4148,11 @@ def _gateway_command_inner(args):
         verbose = getattr(args, 'verbose', 0)
         quiet = getattr(args, 'quiet', False)
         replace = getattr(args, 'replace', False)
-        run_gateway(verbose, quiet=quiet, replace=replace)
+        force_replace = getattr(args, 'force_replace', False)
+        # --force-replace implies --replace.
+        if force_replace:
+            replace = True
+        run_gateway(verbose, quiet=quiet, replace=replace, force_replace=force_replace)
         return
 
     if subcmd == "setup":

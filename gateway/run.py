@@ -5542,6 +5542,33 @@ class GatewayRunner:
             # guess (or answer for both subjects). Token overhead is minimal.
             reply_snippet = event.reply_to_text[:500]
             message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
+        elif getattr(event, "reply_to_audio_path", None):
+            # User @mentioned the bot while replying to a voice/audio message.
+            # Transcribe the referenced audio and inject it as reply context so
+            # the agent can see what voice note the user is referring to.
+            try:
+                _reply_audio_text = await self._enrich_message_with_transcription(
+                    "",
+                    [event.reply_to_audio_path],
+                )
+            except Exception as _reply_audio_err:
+                logger.warning(
+                    "Failed to transcribe replied-to voice message at %s: %s",
+                    event.reply_to_audio_path,
+                    _reply_audio_err,
+                )
+                _reply_audio_text = ""
+            if _reply_audio_text:
+                # Strip the generic "[The user sent a voice message~ ..." wrapper
+                # that _enrich_message_with_transcription emits and reformat as a
+                # reply-context pointer.
+                _voice_snippet = _reply_audio_text.strip()
+                _match = re.search(r'"([^"]*)"', _voice_snippet)
+                if _match:
+                    _voice_snippet = _match.group(1)
+                message_text = (
+                    f'[Replying to voice message: "{_voice_snippet[:500]}"]\n\n{message_text}'
+                )
 
         if "@" in message_text:
             try:
@@ -13625,7 +13652,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker stopped")
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, force_replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
     
@@ -13638,6 +13665,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         replace: If True, kill any existing gateway instance before starting.
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
+        force_replace: If True, bypass the default-profile safety guard that
+                 refuses --replace when an established default-profile
+                 gateway is already running. Implies ``replace``.
     """
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
@@ -13652,9 +13682,65 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         remove_pid_file,
         terminate_pid,
     )
+    if force_replace:
+        replace = True
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
+            # ── Default-profile safety guard ──────────────────────────
+            # The default profile is the easiest one to grab by accident:
+            # any caller that forgets `--profile <name>` will hit it. If a
+            # default-profile gateway has been running long enough to be
+            # serving real traffic, refuse to silently SIGTERM it. The
+            # caller can override with --force-replace if they really mean
+            # it.
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _active_profile = get_active_profile_name()
+            except Exception:
+                _active_profile = "default"
+            if (
+                _active_profile == "default"
+                and not force_replace
+            ):
+                _start_ts = get_process_start_time(existing_pid)
+                _age_seconds: Optional[float] = None
+                if _start_ts is not None:
+                    try:
+                        # _start_ts is in clock ticks since boot — convert
+                        # to wall-clock age via /proc/uptime.
+                        with open("/proc/uptime", "r") as _u:
+                            _uptime = float(_u.read().split()[0])
+                        try:
+                            _hz = os.sysconf("SC_CLK_TCK") or 100
+                        except (ValueError, OSError):
+                            _hz = 100
+                        _age_seconds = _uptime - (_start_ts / _hz)
+                    except Exception:
+                        _age_seconds = None
+                _grace_seconds = 5 * 60
+                if _age_seconds is None or _age_seconds > _grace_seconds:
+                    _age_str = (
+                        f"{int(_age_seconds)}s" if _age_seconds is not None else "unknown age"
+                    )
+                    msg = (
+                        "Refusing to --replace the running default-profile "
+                        f"gateway (PID {existing_pid}, {_age_str}). "
+                        "This protects against accidental SIGTERM when a "
+                        "caller forgot `--profile <name>`. If you meant a "
+                        "different profile, re-run with `--profile <name>`. "
+                        "If you really want to take over the default-profile "
+                        "gateway, re-run with `--force-replace`."
+                    )
+                    logger.error(msg)
+                    print(f"\n❌ {msg}\n")
+                    return False
+                else:
+                    logger.info(
+                        "Default-profile gateway PID %d is only %ss old — allowing --replace without --force-replace.",
+                        existing_pid,
+                        f"{int(_age_seconds)}" if _age_seconds is not None else "?",
+                    )
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",

@@ -8246,6 +8246,17 @@ def main():
         action="store_true",
         help="Replace any existing gateway instance (useful for systemd)",
     )
+    gateway_run.add_argument(
+        "--force-replace",
+        action="store_true",
+        dest="force_replace",
+        help=(
+            "Bypass the default-profile safety guard that refuses --replace "
+            "when an established default-profile gateway is running. Implies "
+            "--replace. Use only when you really mean to take over the "
+            "default-profile gateway."
+        ),
+    )
     _add_accept_hooks_flag(gateway_run)
     _add_accept_hooks_flag(gateway_parser)
 
