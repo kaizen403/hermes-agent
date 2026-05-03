@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -280,7 +281,40 @@ def copilot_device_code_login(
 # Module-level cache for exchanged Copilot API tokens.
 # Maps raw_token_fingerprint -> (api_token, expires_at_epoch).
 _jwt_cache: dict[str, tuple[str, float]] = {}
+_jwt_cache_lock = threading.Lock()
+# Single-flight guard: at most one thread per fingerprint hits the
+# token-exchange endpoint at a time.  Other threads wait, then re-check
+# the cache so they don't all stampede the network.
+_jwt_inflight_locks: dict[str, threading.Lock] = {}
+_jwt_inflight_lock_master = threading.Lock()
 _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
+
+
+def _get_inflight_lock(fp: str) -> threading.Lock:
+    with _jwt_inflight_lock_master:
+        lk = _jwt_inflight_locks.get(fp)
+        if lk is None:
+            lk = threading.Lock()
+            _jwt_inflight_locks[fp] = lk
+        return lk
+
+
+def is_copilot_jwt_fresh(api_token: str, *, margin_seconds: float = _JWT_REFRESH_MARGIN_SECONDS) -> bool:
+    """Return True if *api_token* is in the JWT cache and not within margin of expiry.
+
+    Used by auxiliary client cache lookups to detect stale-token entries
+    *before* a request goes out, instead of waiting for a 401 round-trip.
+    Unknown tokens (not in cache) are considered NOT fresh — caller
+    should evict the cached client and rebuild via the resolver, which
+    will exchange a fresh JWT.
+    """
+    if not api_token:
+        return False
+    with _jwt_cache_lock:
+        for cached_token, expires_at in _jwt_cache.values():
+            if cached_token == api_token:
+                return time.time() < expires_at - margin_seconds
+    return False
 
 # Token exchange endpoint and headers (matching VS Code / Copilot CLI)
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
@@ -294,7 +328,12 @@ def _token_fingerprint(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode()).hexdigest()[:16]
 
 
-def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[str, float]:
+def exchange_copilot_token(
+    raw_token: str,
+    *,
+    timeout: float = 10.0,
+    force_refresh: bool = False,
+) -> tuple[str, float]:
     """Exchange a raw GitHub token for a short-lived Copilot API token.
 
     Calls ``GET https://api.github.com/copilot_internal/v2/token`` with
@@ -304,64 +343,86 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
     used as ``Authorization: Bearer <token>`` for Copilot API requests.
 
     Results are cached in-process and reused until close to expiry.
+    Pass ``force_refresh=True`` to bypass the cache (e.g. on a 401 retry).
+    Single-flight: concurrent callers for the same raw token wait on a
+    per-fingerprint lock so we don't stampede the exchange endpoint.
     Raises ``ValueError`` on failure.
     """
     import urllib.request
 
     fp = _token_fingerprint(raw_token)
 
-    # Check cache first
-    cached = _jwt_cache.get(fp)
-    if cached:
-        api_token, expires_at = cached
-        if time.time() < expires_at - _JWT_REFRESH_MARGIN_SECONDS:
-            return api_token, expires_at
+    # Fast path: cache hit and not forced
+    if not force_refresh:
+        with _jwt_cache_lock:
+            cached = _jwt_cache.get(fp)
+        if cached:
+            api_token, expires_at = cached
+            if time.time() < expires_at - _JWT_REFRESH_MARGIN_SECONDS:
+                return api_token, expires_at
 
-    req = urllib.request.Request(
-        _TOKEN_EXCHANGE_URL,
-        method="GET",
-        headers={
-            "Authorization": f"token {raw_token}",
-            "User-Agent": _EXCHANGE_USER_AGENT,
-            "Accept": "application/json",
-            "Editor-Version": _EDITOR_VERSION,
-        },
-    )
+    # Single-flight: only one thread refreshes per fingerprint.
+    inflight = _get_inflight_lock(fp)
+    with inflight:
+        # Re-check after acquiring the lock — another thread may have
+        # refreshed while we were waiting.
+        if not force_refresh:
+            with _jwt_cache_lock:
+                cached = _jwt_cache.get(fp)
+            if cached:
+                api_token, expires_at = cached
+                if time.time() < expires_at - _JWT_REFRESH_MARGIN_SECONDS:
+                    return api_token, expires_at
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception as exc:
-        raise ValueError(f"Copilot token exchange failed: {exc}") from exc
+        req = urllib.request.Request(
+            _TOKEN_EXCHANGE_URL,
+            method="GET",
+            headers={
+                "Authorization": f"token {raw_token}",
+                "User-Agent": _EXCHANGE_USER_AGENT,
+                "Accept": "application/json",
+                "Editor-Version": _EDITOR_VERSION,
+            },
+        )
 
-    api_token = data.get("token", "")
-    expires_at = data.get("expires_at", 0)
-    if not api_token:
-        raise ValueError("Copilot token exchange returned empty token")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as exc:
+            raise ValueError(f"Copilot token exchange failed: {exc}") from exc
 
-    # Convert expires_at to float if needed
-    expires_at = float(expires_at) if expires_at else time.time() + 1800
+        api_token = data.get("token", "")
+        expires_at = data.get("expires_at", 0)
+        if not api_token:
+            raise ValueError("Copilot token exchange returned empty token")
 
-    _jwt_cache[fp] = (api_token, expires_at)
-    logger.debug(
-        "Copilot token exchanged, expires_at=%s",
-        expires_at,
-    )
-    return api_token, expires_at
+        # Convert expires_at to float if needed
+        expires_at = float(expires_at) if expires_at else time.time() + 1800
+
+        with _jwt_cache_lock:
+            _jwt_cache[fp] = (api_token, expires_at)
+        logger.debug(
+            "Copilot token exchanged (force_refresh=%s), expires_at=%s",
+            force_refresh,
+            expires_at,
+        )
+        return api_token, expires_at
 
 
-def get_copilot_api_token(raw_token: str) -> str:
+def get_copilot_api_token(raw_token: str, *, force_refresh: bool = False) -> str:
     """Exchange a raw GitHub token for a Copilot API token, with fallback.
 
     Convenience wrapper: returns the exchanged token on success, or the
     raw token unchanged if the exchange fails (e.g. network error, unsupported
     account type). This preserves existing behaviour for accounts that don't
     need exchange while enabling access to internal-only models for those that do.
+
+    Pass ``force_refresh=True`` to bypass the JWT cache (used on 401 retry).
     """
     if not raw_token:
         return raw_token
     try:
-        api_token, _ = exchange_copilot_token(raw_token)
+        api_token, _ = exchange_copilot_token(raw_token, force_refresh=force_refresh)
         return api_token
     except Exception as exc:
         logger.debug("Copilot token exchange failed, using raw token: %s", exc)

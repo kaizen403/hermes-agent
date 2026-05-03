@@ -1777,6 +1777,21 @@ def _refresh_provider_credentials(provider: str) -> bool:
                 return False
             _evict_cached_clients(normalized)
             return True
+        if normalized == "copilot":
+            # Copilot IDE JWTs expire every ~30 min.  On a 401 the cache may
+            # still hold a stale entry, so force-refresh past the in-memory
+            # cache by re-exchanging the raw GitHub token, then drop all
+            # cached aux clients so the next call rebuilds with the new JWT.
+            from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
+
+            raw_token, _source = resolve_copilot_token()
+            if not raw_token:
+                return False
+            new_jwt = get_copilot_api_token(raw_token, force_refresh=True)
+            if not str(new_jwt or "").strip():
+                return False
+            _evict_cached_clients(normalized)
+            return True
     except Exception as exc:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
@@ -3034,7 +3049,29 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            # Copilot proactive JWT freshness check: the IDE JWT baked into
+            # the cached client's Authorization header expires every ~30 min.
+            # If it's within 120s of expiry (or no longer in our JWT cache),
+            # evict so we rebuild via resolve_provider_client which calls
+            # get_copilot_api_token() and gets a fresh JWT.  Without this
+            # the aux path silently reuses stale tokens and surfaces as
+            # "HTTP 401: IDE token expired".
+            if _normalize_aux_provider(provider) == "copilot":
+                try:
+                    from hermes_cli.copilot_auth import is_copilot_jwt_fresh
+                    cached_api_key = str(getattr(cached_client, "api_key", "") or "")
+                    if cached_api_key and not is_copilot_jwt_fresh(cached_api_key):
+                        logger.debug(
+                            "Auxiliary copilot client has stale JWT, evicting "
+                            "cache entry to force refresh"
+                        )
+                        if async_mode:
+                            _force_close_async_httpx(cached_client)
+                        del _client_cache[cache_key]
+                        cached_client = None
+                except Exception:
+                    pass
+            if cached_client is not None and async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
@@ -3049,7 +3086,7 @@ def _get_cached_client(
                 # Stale — evict and fall through to create a new client.
                 _force_close_async_httpx(cached_client)
                 del _client_cache[cache_key]
-            else:
+            elif cached_client is not None:
                 effective = _compat_model(cached_client, model, cached_default)
                 return cached_client, effective
     # Build outside the lock
