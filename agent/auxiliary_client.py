@@ -3056,7 +3056,23 @@ def _get_cached_client(
             # get_copilot_api_token() and gets a fresh JWT.  Without this
             # the aux path silently reuses stale tokens and surfaces as
             # "HTTP 401: IDE token expired".
-            if _normalize_aux_provider(provider) == "copilot":
+            # Also fire when provider == "auto" but the cached client is
+            # *actually* talking to the Copilot endpoint — title-generation
+            # and other "auto" aux paths reuse the user's main runtime
+            # (Copilot) and previously skipped the freshness check, surfacing
+            # as "HTTP 401: IDE token expired".
+            _looks_like_copilot = _normalize_aux_provider(provider) == "copilot"
+            if not _looks_like_copilot and cached_client is not None:
+                try:
+                    from utils import base_url_host_matches
+                    cached_base_url = str(getattr(cached_client, "base_url", "") or "")
+                    if cached_base_url and base_url_host_matches(
+                        cached_base_url, "api.githubcopilot.com"
+                    ):
+                        _looks_like_copilot = True
+                except Exception:
+                    pass
+            if _looks_like_copilot:
                 try:
                     from hermes_cli.copilot_auth import is_copilot_jwt_fresh
                     cached_api_key = str(getattr(cached_client, "api_key", "") or "")

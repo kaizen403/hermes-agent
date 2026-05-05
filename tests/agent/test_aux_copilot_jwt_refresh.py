@@ -76,6 +76,100 @@ def test_get_cached_client_evicts_stale_copilot_jwt():
             ac._client_cache.pop(cache_key, None)
 
 
+def test_get_cached_client_evicts_stale_copilot_jwt_when_provider_is_auto():
+    """Regression: provider='auto' aux path (e.g. title generation) reuses
+    the user's main runtime, which for Copilot users points at
+    api.githubcopilot.com. The freshness check must fire on URL match, not
+    on the resolved provider name — otherwise stale JWTs surface as
+    'HTTP 401: IDE token expired'.
+    """
+    from agent import auxiliary_client as ac
+
+    stale_jwt = "tid=stale;exp=000"
+    fresh_jwt = "tid=fresh;exp=999"
+
+    fake_stale_client = MagicMock()
+    fake_stale_client.api_key = stale_jwt
+    fake_stale_client.base_url = "https://api.githubcopilot.com/"
+
+    fake_fresh_client = MagicMock()
+    fake_fresh_client.api_key = fresh_jwt
+    fake_fresh_client.base_url = "https://api.githubcopilot.com/"
+
+    main_runtime = {
+        "provider": "copilot",
+        "model": "claude-opus-4.6",
+        "base_url": "https://api.githubcopilot.com",
+        "api_key": stale_jwt,
+        "api_mode": "",
+    }
+    cache_key = ac._client_cache_key(
+        "auto",
+        async_mode=False,
+        api_key="",
+        base_url="",
+        api_mode="",
+        main_runtime=main_runtime,
+    )
+    with ac._client_cache_lock:
+        ac._client_cache[cache_key] = (fake_stale_client, "claude-opus-4.6", None)
+
+    try:
+        with patch.object(ac, "resolve_provider_client",
+                          return_value=(fake_fresh_client, "claude-opus-4.6")) as rpc, \
+             patch("hermes_cli.copilot_auth.is_copilot_jwt_fresh", return_value=False):
+            client, _model = ac._get_cached_client("auto", main_runtime=main_runtime)
+        assert client is fake_fresh_client, (
+            "auto-provider Copilot client with stale JWT should have been evicted"
+        )
+        rpc.assert_called_once()
+    finally:
+        with ac._client_cache_lock:
+            ac._client_cache.pop(cache_key, None)
+
+
+def test_get_cached_client_skips_jwt_check_for_non_copilot_auto():
+    """auto-provider clients pointing at non-Copilot URLs must NOT trigger
+    the Copilot JWT freshness check (no false-positive evictions for
+    OpenRouter / Anthropic / etc.).
+    """
+    from agent import auxiliary_client as ac
+
+    fake_client = MagicMock()
+    fake_client.api_key = "sk-or-v1-whatever"
+    fake_client.base_url = "https://openrouter.ai/api/v1/"
+
+    main_runtime = {
+        "provider": "openrouter",
+        "model": "anthropic/claude-opus-4",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "sk-or-v1-whatever",
+        "api_mode": "",
+    }
+    cache_key = ac._client_cache_key(
+        "auto",
+        async_mode=False,
+        api_key="",
+        base_url="",
+        api_mode="",
+        main_runtime=main_runtime,
+    )
+    with ac._client_cache_lock:
+        ac._client_cache[cache_key] = (fake_client, "anthropic/claude-opus-4", None)
+
+    try:
+        with patch.object(ac, "resolve_provider_client") as rpc, \
+             patch("hermes_cli.copilot_auth.is_copilot_jwt_fresh",
+                   return_value=False) as fresh_check:
+            client, _model = ac._get_cached_client("auto", main_runtime=main_runtime)
+        assert client is fake_client, "non-Copilot auto client must not be evicted"
+        rpc.assert_not_called()
+        fresh_check.assert_not_called()
+    finally:
+        with ac._client_cache_lock:
+            ac._client_cache.pop(cache_key, None)
+
+
 def test_refresh_provider_credentials_copilot_branch():
     """_refresh_provider_credentials must handle 'copilot' and force-refresh."""
     from agent import auxiliary_client as ac
